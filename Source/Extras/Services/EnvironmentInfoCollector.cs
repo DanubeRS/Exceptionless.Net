@@ -1,45 +1,77 @@
 ﻿using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using Exceptionless.Logging;
 using Exceptionless.Models.Data;
-using Microsoft.VisualBasic.Devices;
 
-namespace Exceptionless.Services {
-    public class EnvironmentInfoCollector : IEnvironmentInfoCollector {
+namespace Exceptionless.Services
+{
+    public class EnvironmentInfoCollector : IEnvironmentInfoCollector
+    {
         private static EnvironmentInfo _environmentInfo;
         private readonly IExceptionlessLog _log;
 
-        public EnvironmentInfoCollector(IExceptionlessLog log) {
+        public EnvironmentInfoCollector(IExceptionlessLog log)
+        {
             _log = log;
         }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        private class MEMORYSTATUSEX
+        {
+            public uint dwLength;
+            public uint dwMemoryLoad;
+            public ulong ullTotalPhys;
+            public ulong ullAvailPhys;
+            public ulong ullTotalPageFile;
+            public ulong ullAvailPageFile;
+            public ulong ullTotalVirtual;
+            public ulong ullAvailVirtual;
+            public ulong ullAvailExtendedVirtual;
+            public MEMORYSTATUSEX()
+            {
+                dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
+            }
+        }
+
+
+        [return: MarshalAs(UnmanagedType.Bool)]
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        static extern bool GlobalMemoryStatusEx([In, Out] MEMORYSTATUSEX lpBuffer);
 
         public EnvironmentInfo GetEnvironmentInfo() {
             if (_environmentInfo != null)
                 return _environmentInfo;
 
             var info = new EnvironmentInfo();
-            ComputerInfo computerInfo = null;
 
             try {
-                computerInfo = new ComputerInfo();
-            } catch (Exception ex) {
-                _log.FormattedInfo(typeof(EnvironmentInfoCollector), "Unable to get computer info. Error message: {0}", ex.Message);
-            }
-
-            try {
-                if (computerInfo != null) {
-                    info.OSName = computerInfo.OSFullName;
-                    info.OSVersion = computerInfo.OSVersion;
+                var loadedManagement = Assembly.Load(new AssemblyName("System.Management, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"));
+                var managementObjectSearcher = loadedManagement.GetTypes().First(t => t.Name == "ManagementObjectSearcher");
+                var managementObject = Activator.CreateInstance(managementObjectSearcher, "SELECT * FROM Win32_OperatingSystem");
+                var managementObjectGet = managementObjectSearcher.InvokeMember("Get", BindingFlags.DeclaredOnly | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.InvokeMethod, null, managementObject, null);
+                var managementObjectCollectionType = loadedManagement.GetTypes().First(t => t.Name == "ManagementObjectCollection");
+                var managementType = loadedManagement.GetTypes().First(t => t.Name == "ManagementObject");
+                var managementGenericMethod = ((IEnumerable)managementObjectGet).Cast<object>();
+                var @object = managementGenericMethod.First();
+                if (@object != null) {
+                    info.OSName = (string)managementType.GetMethods().First(m => m.Name == "GetPropertyValue").Invoke(@object, BindingFlags.DeclaredOnly | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.InvokeMethod, null, new[]{"Caption"}, null);
+                    info.OSVersion = Environment.OSVersion.VersionString;
                 }
-            } catch (Exception ex) {
-                _log.FormattedInfo(typeof(EnvironmentInfoCollector), "Unable to get operating system version. Error message: {0}", ex.Message);
+
+            } catch (Exception e) {
+                _log.FormattedInfo(typeof(EnvironmentInfoCollector), "Could not locate System.Management dll. Reverting to environment for machine OS info.");
+                info.OSName = Environment.OSVersion.VersionString;
+                info.OSVersion = info.OSName;
             }
 
             try {
@@ -52,9 +84,11 @@ namespace Exceptionless.Services {
                         info.AvailablePhysicalMemory = Convert.ToInt64(availablePhysicalMemory.RawValue);
                     }
                 } else {
-                    if (computerInfo != null) {
-                        info.TotalPhysicalMemory = Convert.ToInt64(computerInfo.TotalPhysicalMemory);
-                        info.AvailablePhysicalMemory = Convert.ToInt64(computerInfo.AvailablePhysicalMemory);
+                    var statEX = new MEMORYSTATUSEX();
+                    if (GlobalMemoryStatusEx(statEX)) {
+
+                        info.TotalPhysicalMemory = Convert.ToInt64(statEX.ullTotalPhys);
+                        info.AvailablePhysicalMemory = Convert.ToInt64(statEX.ullAvailPhys);
                     }
                 }
             } catch (Exception ex) {
@@ -153,13 +187,15 @@ namespace Exceptionless.Services {
             return _environmentInfo;
         }
 
-        private static string GetProcessName() {
+        private static string GetProcessName()
+        {
             var buffer = new StringBuilder(1024);
             int length = KernelNativeMethods.GetModuleFileName(KernelNativeMethods.GetModuleHandle(null), buffer, buffer.Capacity);
             return buffer.ToString();
         }
 
-        private static bool Is64BitOperatingSystem() {
+        private static bool Is64BitOperatingSystem()
+        {
             if (IntPtr.Size == 8) // 64-bit programs run only on Win64
                 return true;
 
@@ -170,15 +206,18 @@ namespace Exceptionless.Services {
             return ((methodExist && KernelNativeMethods.IsWow64Process(KernelNativeMethods.GetCurrentProcess(), out is64)) && is64);
         }
 
-        private static bool IsUnix {
-            get {
+        private static bool IsUnix
+        {
+            get
+            {
                 int platform = (int)Environment.OSVersion.Platform;
                 return platform == 4 || platform == 6 || platform == 128;
             }
         }
     }
 
-    internal static class KernelNativeMethods {
+    internal static class KernelNativeMethods
+    {
         #region Kernel32
 
         [DllImport("kernel32", CharSet = CharSet.Auto, SetLastError = true)]
@@ -206,7 +245,8 @@ namespace Exceptionless.Services {
 
         #endregion
 
-        public static bool MethodExists(string moduleName, string methodName) {
+        public static bool MethodExists(string moduleName, string methodName)
+        {
             IntPtr moduleHandle = GetModuleHandle(moduleName);
             if (moduleHandle == IntPtr.Zero)
                 return false;
@@ -214,4 +254,6 @@ namespace Exceptionless.Services {
             return (GetProcAddress(moduleHandle, methodName) != IntPtr.Zero);
         }
     }
+
+
 }
